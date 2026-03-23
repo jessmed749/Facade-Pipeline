@@ -1,0 +1,14 @@
+opencv-python-headless
+pillow
+matplotlib
+numpy
+scipy
+scikit-image
+shapely
+trimesh
+pycocotools
+tqdm
+transformers
+supervision
+rtree
+mapbox_earcut

@@ -1,0 +1,10 @@
+
+# Ignore model checkpoints and generated outputs
+checkpoints/
+output/
+output/**
+
+# Optional local artifacts
+*.log
+*.tmp
+*.cache
