@@ -133,21 +133,61 @@ explorer.exe output/mask_overlay.png
 
 ## Sionna RF simulation
 
-After verifying geometry in Blender, load the scene for ray tracing:
+After verifying geometry in Blender, load the scene for ray tracing.
 
-```bash
-pip install sionna tensorflow
-python3 app/sionna_scene_loader.py
-```
+### How it works
+
+The Sionna workflow has two stages:
+
+**1. Scene loader (`app/sionna_scene_loader.py`)**
+
+Reads `output/sionna_scene.json` (written by the main pipeline) and builds a Mitsuba 3 XML scene file (`output/sionna_scene.xml`). Each per-class `.obj` mesh (e.g. `output/per_class/window.obj`) is registered as a shape, and each shape is assigned an ITU electromagnetic BSDF material. The XML is then loaded into Sionna's `Scene` object using `load_scene()`.
 
 ITU electromagnetic material assignments:
 
 | Semantic class   | Sionna material   |
 |------------------|-------------------|
 | window           | `itu_glass`       |
-| glass window     | `itu_glass`       |
-| window pane      | `itu_glass`       |
+| glass_window     | `itu_glass`       |
+| window_pane      | `itu_glass`       |
 | door             | `itu_wood`        |
+| brick_wall       | `itu_brick`       |
+| concrete_wall    | `itu_concrete`    |
+| pma_building     | `itu_concrete`    |
+
+Run the loader to generate `output/sionna_scene.xml`:
+
+```bash
+pip install sionna tensorflow
+python3 app/sionna_scene_loader.py
+```
+
+**2. Ray tracing experiments (`run_sionna.py`)**
+
+Runs four experiments on the loaded scene at 3.5 GHz (mid-band 5G). TX and RX are single-element isotropic vertical-polarization arrays. Paths are solved with `PathSolver`.
+
+| Experiment | What it measures |
+|---|---|
+| **1 — Non-LoS path validation** | Places TX at `[10, -20, 5]` m and RX at `[0, 20, 2]` m with no line-of-sight. Counts multipath components and prints the path coefficient tensor shape. Confirms the facade geometry is producing reflected/diffracted paths. |
+| **2 — TX height sweep** | Sweeps TX height through 1.5 m, 10 m, 20 m, 35 m while keeping RX fixed. Reports path count and total received power at each height. Shows how elevation above the facade changes multipath richness. |
+| **3 — Reflections on vs off** | Compares `max_depth=4` (reflections enabled) against `max_depth=0` (LoS only). Reports path count and power for both. Quantifies how much the facade contributes to received signal beyond direct path. |
+| **4 — Reflection depth analysis** | Steps `max_depth` from 0 to 5 and records cumulative path count and power at each bounce level. Shows the marginal contribution of each additional reflection order. |
+
+Run all experiments:
+
+```bash
+python3 run_sionna.py
+```
+
+**Scene setup (shared across all experiments)**
+
+```python
+scene.frequency = 3.5e9          # 3.5 GHz
+scene.tx_array  = PlanarArray(num_rows=1, num_cols=1, pattern="iso", polarization="V")
+scene.rx_array  = PlanarArray(num_rows=1, num_cols=1, pattern="iso", polarization="V")
+```
+
+Power reported in experiments 2–4 is the sum of squared real and imaginary path coefficients: `Σ |a|²`.
 
 ---
 
