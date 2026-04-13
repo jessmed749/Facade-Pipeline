@@ -11,12 +11,15 @@ Facade Segmentation Pipeline — windows and doors only, building surfaces only.
     (see app/osm_height.py) — KNOWN_WALL_HEIGHT_M is the fallback.
 """
 
+# ── Lightweight imports only at module level ──────────────────────────────────
+# cv2, torch, transformers, and SAM are NOT imported here.
+# They are loaded lazily in _load_runtime_deps() so that test_pipeline.py can
+# import all pure helper functions (box_iou, nms, mask_to_polygons, etc.)
+# without needing those packages installed (they are absent from
+# requirements-dev.txt by design — no GPU in the unit-test runner).
 import os
-import cv2
 import json
 import math
-import struct
-import torch
 import numpy as np
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
@@ -25,11 +28,47 @@ from shapely.geometry import Polygon
 from shapely.ops import unary_union
 import trimesh
 
-from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
-from segment_anything import sam_model_registry, SamPredictor
+# Placeholders — replaced by _load_runtime_deps() at runtime
+cv2 = None
+torch = None
+AutoProcessor = None
+AutoModelForZeroShotObjectDetection = None
+sam_model_registry = None
+SamPredictor = None
+detect_facade_crop = None
+lookup_building_height = None
 
-from auto_crop import detect_facade_crop
-from osm_height import lookup_building_height
+
+def _load_runtime_deps():
+    """Import all GPU/model dependencies. Call once before running the pipeline."""
+    global cv2, torch
+    global AutoProcessor, AutoModelForZeroShotObjectDetection
+    global sam_model_registry, SamPredictor
+    global detect_facade_crop, lookup_building_height
+
+    import cv2 as _cv2
+    cv2 = _cv2
+
+    import torch as _torch
+    torch = _torch
+
+    from transformers import (
+        AutoProcessor as _AP,
+        AutoModelForZeroShotObjectDetection as _AM,
+    )
+    AutoProcessor = _AP
+    AutoModelForZeroShotObjectDetection = _AM
+
+    from segment_anything import sam_model_registry as _sr, SamPredictor as _sp
+    sam_model_registry = _sr
+    SamPredictor = _sp
+
+    from auto_crop import detect_facade_crop as _dc
+    detect_facade_crop = _dc
+
+    from osm_height import lookup_building_height as _lh
+    lookup_building_height = _lh
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 IMAGE_PATH     = "input/building.jpg"
@@ -90,10 +129,8 @@ SIONNA_MATERIAL = {
     "building door": "itu_wood", "default": "itu_glass",
 }
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-for sub in ["masks", "meshes", "per_class"]:
-    os.makedirs(os.path.join(OUTPUT_DIR, sub), exist_ok=True)
+# NOTE: DEVICE is resolved inside main() after torch is loaded.
+# It is NOT set at module level so that importing this file never touches torch.
 
 
 # ── EXIF / Telemetry ──────────────────────────────────────────────────────────
@@ -175,7 +212,7 @@ def write_facade_json(scene_name, obj_filename, telemetry, output_dir):
     return out_path
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Pure helpers (no torch / cv2 dependency) ──────────────────────────────────
 
 def compute_pixel_to_meter(image_h_px, known_height_m):
     return known_height_m / image_h_px
@@ -321,232 +358,244 @@ def is_valid_box(box, W, H, x_min_px, x_max_px, y_min_px, y_max_px,
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
-print(f"\n{'─'*52}")
-print(f" Facade Pipeline  |  device={DEVICE}")
-print(f"{'─'*52}\n")
+def main():
+    # DEVICE must be resolved here, after torch has been loaded by _load_runtime_deps()
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Step 0: Extract telemetry from EXIF
-print("Extracting telemetry from image EXIF …")
-telemetry = extract_telemetry(IMAGE_PATH)
-print(f"  source  : {telemetry['source']}")
-print(f"  lat     : {telemetry['latitude']}")
-print(f"  lon     : {telemetry['longitude']}")
-print(f"  heading : {telemetry['heading_degrees']}°\n")
+    for sub in ["masks", "meshes", "per_class"]:
+        os.makedirs(os.path.join(OUTPUT_DIR, sub), exist_ok=True)
 
-# Step 1: Load image
-image_pil    = Image.open(IMAGE_PATH).convert("RGB")
-image_source = np.array(image_pil)
-H_px, W_px   = image_source.shape[:2]
+    print(f"\n{'─'*52}")
+    print(f" Facade Pipeline  |  device={DEVICE}")
+    print(f"{'─'*52}\n")
 
-# Step 2: Auto-resolve wall height from OSM
-wall_height_m, height_source = lookup_building_height(
-    lat=telemetry["latitude"],
-    lon=telemetry["longitude"],
-    fallback_m=KNOWN_WALL_HEIGHT_M,
-)
-print(f"  Wall height: {wall_height_m} m  (source: {height_source})\n")
-px2m = compute_pixel_to_meter(H_px, wall_height_m)
+    # Step 0: Extract telemetry from EXIF
+    print("Extracting telemetry from image EXIF …")
+    telemetry = extract_telemetry(IMAGE_PATH)
+    print(f"  source  : {telemetry['source']}")
+    print(f"  lat     : {telemetry['latitude']}")
+    print(f"  lon     : {telemetry['longitude']}")
+    print(f"  heading : {telemetry['heading_degrees']}°\n")
 
-# Step 3: Load models (needed for both auto-crop preflight and main detection)
-print("Loading Grounding DINO …")
-processor       = AutoProcessor.from_pretrained(MODEL_ID)
-grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(MODEL_ID).to(DEVICE)
+    # Step 1: Load image
+    image_pil    = Image.open(IMAGE_PATH).convert("RGB")
+    image_source = np.array(image_pil)
+    H_px, W_px   = image_source.shape[:2]
 
-print("Loading SAM …")
-sam           = sam_model_registry["vit_h"](checkpoint=SAM_CHECKPOINT)
-sam.to(device=DEVICE)
-sam_predictor = SamPredictor(sam)
-sam_predictor.set_image(image_source)
+    # Step 2: Auto-resolve wall height from OSM
+    wall_height_m, height_source = lookup_building_height(
+        lat=telemetry["latitude"],
+        lon=telemetry["longitude"],
+        fallback_m=KNOWN_WALL_HEIGHT_M,
+    )
+    print(f"  Wall height: {wall_height_m} m  (source: {height_source})\n")
+    px2m = compute_pixel_to_meter(H_px, wall_height_m)
 
-# Step 4: Auto-detect crop zone via DINO facade preflight
-(x_min_px, x_max_px, y_min_px, y_max_px), crop_source = detect_facade_crop(
-    image_pil, processor, grounding_model, DEVICE,
-    W_px, H_px,
-    padding_frac=0.02,
-    fallback_top=CROP_TOP_FRACTION,
-    fallback_bottom=CROP_BOTTOM_FRACTION,
-    fallback_left=CROP_LEFT_FRACTION,
-    fallback_right=CROP_RIGHT_FRACTION,
-)
-print(f"  Crop source : {crop_source}")
-print(f"  ROI         : x {x_min_px}–{x_max_px}  y {y_min_px}–{y_max_px} px")
-print(f"  Scale       : {px2m*100:.3f} cm/px  (wall={wall_height_m} m)\n")
+    # Step 3: Load models
+    print("Loading Grounding DINO …")
+    processor       = AutoProcessor.from_pretrained(MODEL_ID)
+    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(MODEL_ID).to(DEVICE)
 
-print(f"Filters: aspect {MIN_ASPECT}–{MAX_ASPECT}  |  "
-      f"box area {MIN_BOX_AREA_FRACTION*100:.2f}%–{MAX_BOX_AREA_FRACTION*100:.1f}%")
-print(f"Classes: {sorted(KEEP_CLASSES)}\n")
+    print("Loading SAM …")
+    sam           = sam_model_registry["vit_h"](checkpoint=SAM_CHECKPOINT)
+    sam.to(device=DEVICE)
+    sam_predictor = SamPredictor(sam)
+    sam_predictor.set_image(image_source)
 
-# Step 5: Detection
-all_boxes, all_phrases, all_scores = [], [], []
-crop_W = x_max_px - x_min_px
+    # Step 4: Auto-detect crop zone via DINO facade preflight
+    (x_min_px, x_max_px, y_min_px, y_max_px), crop_source = detect_facade_crop(
+        image_pil, processor, grounding_model, DEVICE,
+        W_px, H_px,
+        padding_frac=0.02,
+        fallback_top=CROP_TOP_FRACTION,
+        fallback_bottom=CROP_BOTTOM_FRACTION,
+        fallback_left=CROP_LEFT_FRACTION,
+        fallback_right=CROP_RIGHT_FRACTION,
+    )
+    print(f"  Crop source : {crop_source}")
+    print(f"  ROI         : x {x_min_px}–{x_max_px}  y {y_min_px}–{y_max_px} px")
+    print(f"  Scale       : {px2m*100:.3f} cm/px  (wall={wall_height_m} m)\n")
 
-building_crop = image_pil.crop((x_min_px, y_min_px, x_max_px, y_max_px))
-print("Running DINO on building crop (full res) …")
-b, p, s = detect_on_image(building_crop, processor, grounding_model, TEXT_LABELS, DEVICE)
-for box in b:
-    all_boxes.append([box[0]+x_min_px, box[1]+y_min_px,
-                      box[2]+x_min_px, box[3]+y_min_px])
-all_phrases.extend(p)
-all_scores.extend(s)
-print(f"  → {len(b)} detections")
+    print(f"Filters: aspect {MIN_ASPECT}–{MAX_ASPECT}  |  "
+          f"box area {MIN_BOX_AREA_FRACTION*100:.2f}%–{MAX_BOX_AREA_FRACTION*100:.1f}%")
+    print(f"Classes: {sorted(KEEP_CLASSES)}\n")
 
-if USE_TILING:
-    tiles = get_tiles(crop_W, y_max_px - y_min_px, TILE_SIZE, TILE_OVERLAP)
-    print(f"\nRunning DINO on {len(tiles)} tiles of building zone …")
-    for tx0, ty0, tx1, ty1 in tiles:
-        tile_pil = image_pil.crop((tx0+x_min_px, ty0+y_min_px,
-                                   tx1+x_min_px, ty1+y_min_px))
-        tb, tp, ts = detect_on_image(tile_pil, processor, grounding_model, TEXT_LABELS, DEVICE)
-        for box in tb:
-            all_boxes.append([box[0]+tx0+x_min_px, box[1]+ty0+y_min_px,
-                               box[2]+tx0+x_min_px, box[3]+ty0+y_min_px])
-        all_phrases.extend(tp)
-        all_scores.extend(ts)
-    print(f"  → {len(all_boxes)} raw detections before filtering")
+    # Step 5: Detection
+    all_boxes, all_phrases, all_scores = [], [], []
+    crop_W = x_max_px - x_min_px
 
-from collections import Counter
-label_counts = Counter(str(p).lower().strip() for p in all_phrases)
-print("\nDINO label distribution:")
-for label, count in label_counts.most_common(20):
-    print(f"  {label:<30} {count}")
+    building_crop = image_pil.crop((x_min_px, y_min_px, x_max_px, y_max_px))
+    print("Running DINO on building crop (full res) …")
+    b, p, s = detect_on_image(building_crop, processor, grounding_model, TEXT_LABELS, DEVICE)
+    for box in b:
+        all_boxes.append([box[0]+x_min_px, box[1]+y_min_px,
+                          box[2]+x_min_px, box[3]+y_min_px])
+    all_phrases.extend(p)
+    all_scores.extend(s)
+    print(f"  → {len(b)} detections")
 
-# Step 6: Filter
-filtered_boxes, filtered_phrases, filtered_scores = [], [], []
-rejected = {"class": 0, "crop": 0, "size": 0, "aspect": 0}
+    if USE_TILING:
+        tiles = get_tiles(crop_W, y_max_px - y_min_px, TILE_SIZE, TILE_OVERLAP)
+        print(f"\nRunning DINO on {len(tiles)} tiles of building zone …")
+        for tx0, ty0, tx1, ty1 in tiles:
+            tile_pil = image_pil.crop((tx0+x_min_px, ty0+y_min_px,
+                                       tx1+x_min_px, ty1+y_min_px))
+            tb, tp, ts = detect_on_image(tile_pil, processor, grounding_model, TEXT_LABELS, DEVICE)
+            for box in tb:
+                all_boxes.append([box[0]+tx0+x_min_px, box[1]+ty0+y_min_px,
+                                   box[2]+tx0+x_min_px, box[3]+ty0+y_min_px])
+            all_phrases.extend(tp)
+            all_scores.extend(ts)
+        print(f"  → {len(all_boxes)} raw detections before filtering")
 
-for box, phrase, score in zip(all_boxes, all_phrases, all_scores):
-    phrase = str(phrase).lower().strip()
-    if not phrase_matches(phrase, KEEP_CLASSES):
-        rejected["class"] += 1
-        continue
-    phrase = normalize_phrase(phrase)
-    ok, reason = is_valid_box(box, W_px, H_px, x_min_px, x_max_px,
-                               y_min_px, y_max_px,
-                               MIN_BOX_AREA_FRACTION, MAX_BOX_AREA_FRACTION,
-                               MIN_ASPECT, MAX_ASPECT)
-    if not ok:
-        key = "crop" if "crop" in reason else ("aspect" if "aspect" in reason else "size")
-        rejected[key] += 1
-        continue
-    filtered_boxes.append(box)
-    filtered_phrases.append(phrase)
-    filtered_scores.append(score)
+    from collections import Counter
+    label_counts = Counter(str(p).lower().strip() for p in all_phrases)
+    print("\nDINO label distribution:")
+    for label, count in label_counts.most_common(20):
+        print(f"  {label:<30} {count}")
 
-print(f"\nFiltering: kept {len(filtered_boxes)}  |  "
-      f"rejected class={rejected['class']}  crop={rejected['crop']}  "
-      f"size={rejected['size']}  aspect={rejected['aspect']}")
+    # Step 6: Filter
+    filtered_boxes, filtered_phrases, filtered_scores = [], [], []
+    rejected = {"class": 0, "crop": 0, "size": 0, "aspect": 0}
 
-# Step 7: NMS
-if filtered_boxes:
-    fb = np.array(filtered_boxes)
-    fs = np.array(filtered_scores)
-    fb, filtered_phrases, fs = nms(fb, filtered_phrases, fs, NMS_IOU_THRESH)
-    print(f"After NMS: {len(fb)} detections\n")
-else:
-    fb, fs = np.zeros((0, 4)), np.array([])
-    print("  No detections survived filtering. Try lowering BOX_THRESHOLD.\n")
-
-# Step 8: SAM + mesh export
-scene_meshes, metadata, class_polygons = [], [], {}
-
-for idx, (box, phrase, score) in enumerate(zip(fb, filtered_phrases, fs)):
-    phrase = str(phrase)
-    print(f"[{idx:03d}] {phrase:<22}  score={score:.2f}")
-
-    box = np.clip(np.array(box, dtype=np.float32), [0,0,0,0], [W_px,H_px,W_px,H_px])
-    masks, mask_scores, _ = sam_predictor.predict(box=box, multimask_output=True)
-    best = int(np.argmax(mask_scores))
-    mask = clean_binary_mask(masks[best], min_area=300)
-
-    mask[y_max_px:, :] = 0
-    mask[:y_min_px, :] = 0
-    mask[:, :x_min_px] = 0
-    mask[:, x_max_px:] = 0
-
-    safe = phrase_to_safe(phrase)
-    cv2.imwrite(os.path.join(OUTPUT_DIR, "masks", f"{idx:03d}_{safe}.png"),
-                (mask*255).astype(np.uint8))
-
-    polys = mask_to_polygons(mask, px2m)
-    if not polys:
-        print(f"  ↳ no valid polygons, skipping")
-        continue
-
-    merged = unary_union(polys)
-    geoms  = [merged] if merged.geom_type == "Polygon" else list(merged.geoms)
-    class_polygons.setdefault(phrase, []).extend(geoms)
-
-    extrude_m  = get_extrude(phrase)
-    sionna_mat = get_sionna_mat(phrase)
-
-    for j, poly in enumerate(geoms):
-        mesh = polygon_to_mesh(poly, extrude_m)
-        if mesh is None:
+    for box, phrase, score in zip(all_boxes, all_phrases, all_scores):
+        phrase = str(phrase).lower().strip()
+        if not phrase_matches(phrase, KEEP_CLASSES):
+            rejected["class"] += 1
             continue
-        obj_path = os.path.join(OUTPUT_DIR, "meshes", f"{idx:03d}_{j:02d}_{safe}.obj")
-        mesh.export(obj_path)
-        scene_meshes.append((mesh, sionna_mat, phrase))
-        metadata.append({
-            "id": f"{idx:03d}_{j:02d}", "label": phrase,
-            "sionna_material": sionna_mat, "extrude_m": extrude_m,
-            "area_m2": round(poly.area, 4),
-            "mesh_file": os.path.basename(obj_path),
-        })
+        phrase = normalize_phrase(phrase)
+        ok, reason = is_valid_box(box, W_px, H_px, x_min_px, x_max_px,
+                                   y_min_px, y_max_px,
+                                   MIN_BOX_AREA_FRACTION, MAX_BOX_AREA_FRACTION,
+                                   MIN_ASPECT, MAX_ASPECT)
+        if not ok:
+            key = "crop" if "crop" in reason else ("aspect" if "aspect" in reason else "size")
+            rejected[key] += 1
+            continue
+        filtered_boxes.append(box)
+        filtered_phrases.append(phrase)
+        filtered_scores.append(score)
 
-    print(f"  ↳ {len(geoms)} polygon(s)  mat={sionna_mat}  depth={extrude_m}m")
+    print(f"\nFiltering: kept {len(filtered_boxes)}  |  "
+          f"rejected class={rejected['class']}  crop={rejected['crop']}  "
+          f"size={rejected['size']}  aspect={rejected['aspect']}")
 
-# Step 9: Export meshes
-print("\nExporting …")
-obj_filename = f"{SCENE_NAME}.obj"
+    # Step 7: NMS
+    if filtered_boxes:
+        fb = np.array(filtered_boxes)
+        fs = np.array(filtered_scores)
+        fb, filtered_phrases, fs = nms(fb, filtered_phrases, fs, NMS_IOU_THRESH)
+        print(f"After NMS: {len(fb)} detections\n")
+    else:
+        fb, fs = np.zeros((0, 4)), np.array([])
+        print("  No detections survived filtering. Try lowering BOX_THRESHOLD.\n")
 
-if scene_meshes:
-    combined = trimesh.util.concatenate([m for m, _, _ in scene_meshes])
-    combined.export(os.path.join(OUTPUT_DIR, obj_filename))
-    b2 = combined.bounds
-    d  = b2[1] - b2[0]
-    print(f"  Scene: X={d[0]:.2f}m  Y={d[1]:.2f}m  Z={d[2]:.2f}m")
+    # Step 8: SAM + mesh export
+    scene_meshes, metadata, class_polygons = [], [], {}
 
-for cls, polys in class_polygons.items():
-    safe = phrase_to_safe(cls)
-    ext  = get_extrude(cls)
-    ms   = [m for p in polys if (m := polygon_to_mesh(p, ext)) is not None]
-    if not ms:
-        continue
-    trimesh.util.concatenate(ms).export(
-        os.path.join(OUTPUT_DIR, "per_class", f"{safe}.obj"))
-    print(f"  → per_class/{safe}.obj  ({len(ms)} meshes)")
+    for idx, (box, phrase, score) in enumerate(zip(fb, filtered_phrases, fs)):
+        phrase = str(phrase)
+        print(f"[{idx:03d}] {phrase:<22}  score={score:.2f}")
 
-# Sionna scene JSON
-json.dump(
-    {
-        "scene_name": "ut_campus_facade",
-        "px_to_meter": px2m,
-        "image_size_px": [W_px, H_px],
-        "wall_height_m": wall_height_m,
-        "wall_height_source": height_source,
-        "crop_source": crop_source,
-        "crop_bounds_px": [x_min_px, x_max_px, y_min_px, y_max_px],
-        "objects": metadata,
-    },
-    open(os.path.join(OUTPUT_DIR, "sionna_scene.json"), "w"),
-    indent=2,
-)
+        box = np.clip(np.array(box, dtype=np.float32), [0,0,0,0], [W_px,H_px,W_px,H_px])
+        masks, mask_scores, _ = sam_predictor.predict(box=box, multimask_output=True)
+        best = int(np.argmax(mask_scores))
+        mask = clean_binary_mask(masks[best], min_area=300)
 
-# Step 10: Facade anchor JSON
-facade_json_path = write_facade_json(SCENE_NAME, obj_filename, telemetry, OUTPUT_DIR)
-print(f"\n✓ Facade anchor JSON → {facade_json_path}")
-print(json.dumps({
-    "device_telemetry": {
-        "latitude":        telemetry["latitude"],
-        "longitude":       telemetry["longitude"],
-        "heading_degrees": telemetry["heading_degrees"],
-    },
-    "mesh_metadata": {
-        "file_name":         obj_filename,
-        "front_facing_axis": "-Y",
-    },
-}, indent=2))
+        mask[y_max_px:, :] = 0
+        mask[:y_min_px, :] = 0
+        mask[:, :x_min_px] = 0
+        mask[:, x_max_px:] = 0
 
-print(f"\n✓ done  —  {len(metadata)} mesh regions exported")
-print(f"  height source : {height_source}")
-print(f"  crop source   : {crop_source}\n")
+        safe = phrase_to_safe(phrase)
+        cv2.imwrite(os.path.join(OUTPUT_DIR, "masks", f"{idx:03d}_{safe}.png"),
+                    (mask*255).astype(np.uint8))
+
+        polys = mask_to_polygons(mask, px2m)
+        if not polys:
+            print(f"  ↳ no valid polygons, skipping")
+            continue
+
+        merged = unary_union(polys)
+        geoms  = [merged] if merged.geom_type == "Polygon" else list(merged.geoms)
+        class_polygons.setdefault(phrase, []).extend(geoms)
+
+        extrude_m  = get_extrude(phrase)
+        sionna_mat = get_sionna_mat(phrase)
+
+        for j, poly in enumerate(geoms):
+            mesh = polygon_to_mesh(poly, extrude_m)
+            if mesh is None:
+                continue
+            obj_path = os.path.join(OUTPUT_DIR, "meshes", f"{idx:03d}_{j:02d}_{safe}.obj")
+            mesh.export(obj_path)
+            scene_meshes.append((mesh, sionna_mat, phrase))
+            metadata.append({
+                "id": f"{idx:03d}_{j:02d}", "label": phrase,
+                "sionna_material": sionna_mat, "extrude_m": extrude_m,
+                "area_m2": round(poly.area, 4),
+                "mesh_file": os.path.basename(obj_path),
+            })
+
+        print(f"  ↳ {len(geoms)} polygon(s)  mat={sionna_mat}  depth={extrude_m}m")
+
+    # Step 9: Export meshes
+    print("\nExporting …")
+    obj_filename = f"{SCENE_NAME}.obj"
+
+    if scene_meshes:
+        combined = trimesh.util.concatenate([m for m, _, _ in scene_meshes])
+        combined.export(os.path.join(OUTPUT_DIR, obj_filename))
+        b2 = combined.bounds
+        d  = b2[1] - b2[0]
+        print(f"  Scene: X={d[0]:.2f}m  Y={d[1]:.2f}m  Z={d[2]:.2f}m")
+
+    for cls, polys in class_polygons.items():
+        safe = phrase_to_safe(cls)
+        ext  = get_extrude(cls)
+        ms   = [m for p in polys if (m := polygon_to_mesh(p, ext)) is not None]
+        if not ms:
+            continue
+        trimesh.util.concatenate(ms).export(
+            os.path.join(OUTPUT_DIR, "per_class", f"{safe}.obj"))
+        print(f"  → per_class/{safe}.obj  ({len(ms)} meshes)")
+
+    # Sionna scene JSON
+    json.dump(
+        {
+            "scene_name": "ut_campus_facade",
+            "px_to_meter": px2m,
+            "image_size_px": [W_px, H_px],
+            "wall_height_m": wall_height_m,
+            "wall_height_source": height_source,
+            "crop_source": crop_source,
+            "crop_bounds_px": [x_min_px, x_max_px, y_min_px, y_max_px],
+            "objects": metadata,
+        },
+        open(os.path.join(OUTPUT_DIR, "sionna_scene.json"), "w"),
+        indent=2,
+    )
+
+    # Step 10: Facade anchor JSON
+    facade_json_path = write_facade_json(SCENE_NAME, obj_filename, telemetry, OUTPUT_DIR)
+    print(f"\n✓ Facade anchor JSON → {facade_json_path}")
+    print(json.dumps({
+        "device_telemetry": {
+            "latitude":        telemetry["latitude"],
+            "longitude":       telemetry["longitude"],
+            "heading_degrees": telemetry["heading_degrees"],
+        },
+        "mesh_metadata": {
+            "file_name":         obj_filename,
+            "front_facing_axis": "-Y",
+        },
+    }, indent=2))
+
+    print(f"\n✓ done  —  {len(metadata)} mesh regions exported")
+    print(f"  height source : {height_source}")
+    print(f"  crop source   : {crop_source}\n")
+
+
+if __name__ == "__main__":
+    _load_runtime_deps()
+    main()
