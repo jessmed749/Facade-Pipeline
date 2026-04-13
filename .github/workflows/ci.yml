@@ -1,0 +1,97 @@
+name: facade-pipeline-ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Unit tests (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install -r requirements-dev.txt -q
+      - run: pytest tests/test_pipeline.py -v -m "not integration" --tb=short
+
+  mesh-and-sionna:
+    name: Mesh + Sionna validation (GPU)
+    runs-on: [self-hosted, gpu]
+    needs: unit-tests
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull or build Docker image
+        run: docker pull facade-sam:latest 2>/dev/null || docker build -t facade-sam:latest .
+
+      - name: Ensure checkpoints
+        run: bash scripts/download_models.sh
+
+      - name: Run pipeline on test fixture
+        run: |
+          mkdir -p test-output
+          docker run --rm --gpus all \
+            -v ${{ github.workspace }}/checkpoints:/workspace/checkpoints \
+            -v ${{ github.workspace }}/tests/fixtures:/workspace/input \
+            -v ${{ github.workspace }}/test-output:/workspace/output \
+            -v ${{ github.workspace }}/app:/workspace/app \
+            -v ${{ github.workspace }}/.hf_cache:/root/.cache/huggingface \
+            facade-sam:latest python3 app/run_facade_pipeline.py
+
+      - name: Generate Sionna XML
+        run: |
+          docker run --rm --gpus all \
+            -v ${{ github.workspace }}/test-output:/workspace/output \
+            -v ${{ github.workspace }}/app:/workspace/app \
+            -e FACADE_OUTPUT_DIR=/workspace/output \
+            facade-sam:latest python3 app/sionna_scene_loader.py
+
+      - name: Validate outputs (tier 2 + 3)
+        run: |
+          docker run --rm --gpus all \
+            -v ${{ github.workspace }}/test-output:/workspace/output \
+            -v ${{ github.workspace }}/tests:/workspace/tests \
+            facade-sam:latest \
+            python3 tests/validate_outputs.py --output-dir /workspace/output
+
+      - name: Upload report + overlay
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-report
+          path: |
+            test-output/validation_report.json
+            test-output/mask_overlay.png
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const p = 'test-output/validation_report.json';
+            if (!fs.existsSync(p)) {
+              return github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner, repo: context.repo.repo,
+                body: '**Validation report not found** — pipeline failed before writing output.',
+              });
+            }
+            const r = JSON.parse(fs.readFileSync(p));
+            const icon = r.success ? '✅' : '❌';
+            const rows = r.checks.map(c => {
+              const s = {PASS:'✓', FAIL:'✗', SKIP:'–'}[c.status] || '?';
+              return `| ${s} | ${c.check} | ${c.detail || ''} |`;
+            }).join('\n');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner, repo: context.repo.repo,
+              body: `## ${icon} Facade pipeline validation\n\n` +
+                `**${r.passed} passed · ${r.failed} failed · ${r.skipped} skipped**\n\n` +
+                `| | Check | Detail |\n|---|---|---|\n${rows}`,
+            });

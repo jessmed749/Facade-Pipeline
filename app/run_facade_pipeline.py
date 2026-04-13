@@ -4,6 +4,11 @@ Facade Segmentation Pipeline — windows and doors only, building surfaces only.
   - Exports facade_<scene_name>.json with device_telemetry + mesh_metadata
   - GPS lat/lon and heading are extracted from the input image EXIF metadata
     automatically; if EXIF is missing, falls back to config values.
+  - Crop zones are AUTO-DETECTED via a DINO facade preflight pass
+    (see app/auto_crop.py) — manual CROP_*_FRACTION values are only used
+    as a fallback when DINO finds nothing.
+  - Wall height is AUTO-QUERIED from OpenStreetMap using EXIF GPS coordinates
+    (see app/osm_height.py) — KNOWN_WALL_HEIGHT_M is the fallback.
 """
 
 import os
@@ -23,20 +28,22 @@ import trimesh
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 from segment_anything import sam_model_registry, SamPredictor
 
-# Config
+from auto_crop import detect_facade_crop
+from osm_height import lookup_building_height
+
+# ── Config ────────────────────────────────────────────────────────────────────
 IMAGE_PATH     = "input/building.jpg"
 SAM_CHECKPOINT = "checkpoints/sam_vit_h_4b8939.pth"
 OUTPUT_DIR     = "output"
 MODEL_ID       = "IDEA-Research/grounding-dino-base"
-
-# Scene / facade name — used for the output .obj and facade_*.json filenames
-SCENE_NAME     = "combined_scene"   # → combined_scene.obj + facade_combined_scene.json
+SCENE_NAME     = "combined_scene"
 
 # Fallback telemetry — used ONLY if the image has no GPS EXIF data
 FALLBACK_LATITUDE        = 30.288753
 FALLBACK_LONGITUDE       = -97.736348
 FALLBACK_HEADING_DEGREES = 94.67
 
+# ── Detection thresholds ──────────────────────────────────────────────────────
 BOX_THRESHOLD  = 0.18
 TEXT_THRESHOLD = 0.15
 
@@ -45,11 +52,16 @@ TILE_SIZE      = 512
 TILE_OVERLAP   = 128
 NMS_IOU_THRESH = 0.25
 
+# ── Manual crop fallbacks (used only when DINO auto-crop finds nothing) ───────
 CROP_BOTTOM_FRACTION = 0.15
 CROP_TOP_FRACTION    = 0.08
 CROP_LEFT_FRACTION   = 0.08
 CROP_RIGHT_FRACTION  = 0.95
 
+# ── Scale fallback (used only when OSM lookup returns nothing) ────────────────
+KNOWN_WALL_HEIGHT_M = 28.0
+
+# ── Geometry filters ──────────────────────────────────────────────────────────
 MIN_BOX_AREA_FRACTION = 0.0003
 MAX_BOX_AREA_FRACTION = 0.015
 MIN_ASPECT = 0.2
@@ -64,8 +76,6 @@ TEXT_LABELS = [[
     "window", "glass window", "window frame", "window pane",
     "door", "building window", "building door",
 ]]
-
-KNOWN_WALL_HEIGHT_M = 28.0
 
 EXTRUDE_DEPTH_M = {
     "window": 0.05, "glass window": 0.05, "window frame": 0.08,
@@ -86,19 +96,16 @@ for sub in ["masks", "meshes", "per_class"]:
     os.makedirs(os.path.join(OUTPUT_DIR, sub), exist_ok=True)
 
 
-# EXIF / Telemetry extraction
+# ── EXIF / Telemetry ──────────────────────────────────────────────────────────
 
 def _dms_to_decimal(dms, ref):
-    """Convert EXIF GPS DMS tuple to signed decimal degrees."""
     def to_float(v):
         if isinstance(v, tuple):
             return v[0] / v[1] if v[1] else 0.0
-        # Pillow >= 9.1 returns IFDRational objects
         try:
             return float(v)
         except Exception:
             return 0.0
-
     deg, mn, sec = (to_float(x) for x in dms)
     decimal = deg + mn / 60.0 + sec / 3600.0
     if ref in ("S", "W"):
@@ -107,34 +114,19 @@ def _dms_to_decimal(dms, ref):
 
 
 def extract_telemetry(image_path):
-    """
-    Read GPS latitude, longitude, and camera heading from JPEG EXIF.
-
-    Returns a dict:
-        {"latitude": float, "longitude": float, "heading_degrees": float,
-         "source": "exif" | "fallback"}
-
-    Falls back to FALLBACK_* constants when EXIF data is absent or incomplete.
-    """
     lat = lon = heading = None
     try:
         img = Image.open(image_path)
         exif_raw = img._getexif()
         if exif_raw:
-            # Decode tag names
             exif = {TAGS.get(k, k): v for k, v in exif_raw.items()}
-
-# EXIF / Telemetry extraction
             gps_info_raw = exif.get("GPSInfo")
             if gps_info_raw:
                 gps = {GPSTAGS.get(k, k): v for k, v in gps_info_raw.items()}
-
                 if all(k in gps for k in ("GPSLatitude", "GPSLatitudeRef",
                                            "GPSLongitude", "GPSLongitudeRef")):
                     lat = _dms_to_decimal(gps["GPSLatitude"],  gps["GPSLatitudeRef"])
                     lon = _dms_to_decimal(gps["GPSLongitude"], gps["GPSLongitudeRef"])
-
-                # Heading: prefer ImgDirection (true bearing), fall back to Track
                 for tag in ("GPSImgDirection", "GPSTrack"):
                     if tag in gps:
                         v = gps[tag]
@@ -147,13 +139,12 @@ def extract_telemetry(image_path):
                                 pass
                         if heading is not None:
                             break
-
     except Exception as e:
         print(f"  EXIF read error: {e}")
 
     source = "exif"
     if lat is None or lon is None:
-        print("  No GPS coordinates in EXIF — using fallback values.")
+        print("  No GPS in EXIF — using fallback values.")
         lat, lon = FALLBACK_LATITUDE, FALLBACK_LONGITUDE
         source = "fallback"
     if heading is None:
@@ -167,19 +158,15 @@ def extract_telemetry(image_path):
 
 
 def write_facade_json(scene_name, obj_filename, telemetry, output_dir):
-    """
-    Write facade_<scene_name>.json in the format required by the digital-twin
-    anchoring pipeline (Output Requirements spec).
-    """
     payload = {
         "device_telemetry": {
-            "latitude":         telemetry["latitude"],
-            "longitude":        telemetry["longitude"],
-            "heading_degrees":  telemetry["heading_degrees"],
+            "latitude":        telemetry["latitude"],
+            "longitude":       telemetry["longitude"],
+            "heading_degrees": telemetry["heading_degrees"],
         },
         "mesh_metadata": {
-            "file_name":          obj_filename,
-            "front_facing_axis":  "-Y",
+            "file_name":         obj_filename,
+            "front_facing_axis": "-Y",
         },
     }
     out_path = os.path.join(output_dir, f"facade_{scene_name}.json")
@@ -188,7 +175,7 @@ def write_facade_json(scene_name, obj_filename, telemetry, output_dir):
     return out_path
 
 
-# Helpers
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def compute_pixel_to_meter(image_h_px, known_height_m):
     return known_height_m / image_h_px
@@ -317,32 +304,28 @@ def is_valid_box(box, W, H, x_min_px, x_max_px, y_min_px, y_max_px,
     x1, y1, x2, y2 = box
     cx, cy = (x1+x2)/2, (y1+y2)/2
     bw, bh = x2-x1, y2-y1
-
     if cx < x_min_px or cx > x_max_px:
         return False, "outside crop zone"
     if cy < y_min_px or cy > y_max_px:
         return False, "outside crop zone"
-
     box_area = bw * bh
     if box_area < min_area_frac * W * H:
         return False, "too small"
     if box_area > max_area_frac * W * H:
         return False, "too large"
-
     aspect = bw / bh if bh > 0 else 999
     if aspect < min_asp or aspect > max_asp:
         return False, "bad aspect"
-
     return True, ""
 
 
-# Main pipeline
+# ── Main pipeline ─────────────────────────────────────────────────────────────
 
 print(f"\n{'─'*52}")
 print(f" Facade Pipeline  |  device={DEVICE}")
 print(f"{'─'*52}\n")
 
-# Step 0: Extract telemetry from image EXIF
+# Step 0: Extract telemetry from EXIF
 print("Extracting telemetry from image EXIF …")
 telemetry = extract_telemetry(IMAGE_PATH)
 print(f"  source  : {telemetry['source']}")
@@ -354,19 +337,17 @@ print(f"  heading : {telemetry['heading_degrees']}°\n")
 image_pil    = Image.open(IMAGE_PATH).convert("RGB")
 image_source = np.array(image_pil)
 H_px, W_px   = image_source.shape[:2]
-px2m         = compute_pixel_to_meter(H_px, KNOWN_WALL_HEIGHT_M)
 
-y_min_px = int(H_px * CROP_TOP_FRACTION)
-y_max_px = int(H_px * (1.0 - CROP_BOTTOM_FRACTION))
-x_min_px = int(W_px * CROP_LEFT_FRACTION)
-x_max_px = int(W_px * CROP_RIGHT_FRACTION)
+# Step 2: Auto-resolve wall height from OSM
+wall_height_m, height_source = lookup_building_height(
+    lat=telemetry["latitude"],
+    lon=telemetry["longitude"],
+    fallback_m=KNOWN_WALL_HEIGHT_M,
+)
+print(f"  Wall height: {wall_height_m} m  (source: {height_source})\n")
+px2m = compute_pixel_to_meter(H_px, wall_height_m)
 
-print(f"Image  : {W_px}×{H_px} px  |  {px2m*100:.3f} cm/px  (wall={KNOWN_WALL_HEIGHT_M} m)")
-print(f"ROI    : x {x_min_px}–{x_max_px}  y {y_min_px}–{y_max_px} px")
-print(f"Filters: aspect {MIN_ASPECT}–{MAX_ASPECT}  |  box area {MIN_BOX_AREA_FRACTION*100:.2f}%–{MAX_BOX_AREA_FRACTION*100:.1f}%")
-print(f"Classes: {sorted(KEEP_CLASSES)}\n")
-
-# Step 2: Load models
+# Step 3: Load models (needed for both auto-crop preflight and main detection)
 print("Loading Grounding DINO …")
 processor       = AutoProcessor.from_pretrained(MODEL_ID)
 grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(MODEL_ID).to(DEVICE)
@@ -377,12 +358,29 @@ sam.to(device=DEVICE)
 sam_predictor = SamPredictor(sam)
 sam_predictor.set_image(image_source)
 
-# Step 3: Detection
-all_boxes, all_phrases, all_scores = [], [], []
+# Step 4: Auto-detect crop zone via DINO facade preflight
+(x_min_px, x_max_px, y_min_px, y_max_px), crop_source = detect_facade_crop(
+    image_pil, processor, grounding_model, DEVICE,
+    W_px, H_px,
+    padding_frac=0.02,
+    fallback_top=CROP_TOP_FRACTION,
+    fallback_bottom=CROP_BOTTOM_FRACTION,
+    fallback_left=CROP_LEFT_FRACTION,
+    fallback_right=CROP_RIGHT_FRACTION,
+)
+print(f"  Crop source : {crop_source}")
+print(f"  ROI         : x {x_min_px}–{x_max_px}  y {y_min_px}–{y_max_px} px")
+print(f"  Scale       : {px2m*100:.3f} cm/px  (wall={wall_height_m} m)\n")
 
-building_crop = image_pil.crop((x_min_px, y_min_px, x_max_px, y_max_px))
+print(f"Filters: aspect {MIN_ASPECT}–{MAX_ASPECT}  |  "
+      f"box area {MIN_BOX_AREA_FRACTION*100:.2f}%–{MAX_BOX_AREA_FRACTION*100:.1f}%")
+print(f"Classes: {sorted(KEEP_CLASSES)}\n")
+
+# Step 5: Detection
+all_boxes, all_phrases, all_scores = [], [], []
 crop_W = x_max_px - x_min_px
 
+building_crop = image_pil.crop((x_min_px, y_min_px, x_max_px, y_max_px))
 print("Running DINO on building crop (full res) …")
 b, p, s = detect_on_image(building_crop, processor, grounding_model, TEXT_LABELS, DEVICE)
 for box in b:
@@ -412,19 +410,16 @@ print("\nDINO label distribution:")
 for label, count in label_counts.most_common(20):
     print(f"  {label:<30} {count}")
 
-# Step 4: Filter
+# Step 6: Filter
 filtered_boxes, filtered_phrases, filtered_scores = [], [], []
 rejected = {"class": 0, "crop": 0, "size": 0, "aspect": 0}
 
 for box, phrase, score in zip(all_boxes, all_phrases, all_scores):
     phrase = str(phrase).lower().strip()
-
     if not phrase_matches(phrase, KEEP_CLASSES):
         rejected["class"] += 1
         continue
-
     phrase = normalize_phrase(phrase)
-
     ok, reason = is_valid_box(box, W_px, H_px, x_min_px, x_max_px,
                                y_min_px, y_max_px,
                                MIN_BOX_AREA_FRACTION, MAX_BOX_AREA_FRACTION,
@@ -433,7 +428,6 @@ for box, phrase, score in zip(all_boxes, all_phrases, all_scores):
         key = "crop" if "crop" in reason else ("aspect" if "aspect" in reason else "size")
         rejected[key] += 1
         continue
-
     filtered_boxes.append(box)
     filtered_phrases.append(phrase)
     filtered_scores.append(score)
@@ -442,7 +436,7 @@ print(f"\nFiltering: kept {len(filtered_boxes)}  |  "
       f"rejected class={rejected['class']}  crop={rejected['crop']}  "
       f"size={rejected['size']}  aspect={rejected['aspect']}")
 
-# Step 5: NMS
+# Step 7: NMS
 if filtered_boxes:
     fb = np.array(filtered_boxes)
     fs = np.array(filtered_scores)
@@ -452,7 +446,7 @@ else:
     fb, fs = np.zeros((0, 4)), np.array([])
     print("  No detections survived filtering. Try lowering BOX_THRESHOLD.\n")
 
-# Step 6: SAM + mesh export
+# Step 8: SAM + mesh export
 scene_meshes, metadata, class_polygons = [], [], {}
 
 for idx, (box, phrase, score) in enumerate(zip(fb, filtered_phrases, fs)):
@@ -501,7 +495,7 @@ for idx, (box, phrase, score) in enumerate(zip(fb, filtered_phrases, fs)):
 
     print(f"  ↳ {len(geoms)} polygon(s)  mat={sionna_mat}  depth={extrude_m}m")
 
-# Step 7: Export
+# Step 9: Export meshes
 print("\nExporting …")
 obj_filename = f"{SCENE_NAME}.obj"
 
@@ -522,21 +516,23 @@ for cls, polys in class_polygons.items():
         os.path.join(OUTPUT_DIR, "per_class", f"{safe}.obj"))
     print(f"  → per_class/{safe}.obj  ({len(ms)} meshes)")
 
-# Sionna scene JSON (internal use)
+# Sionna scene JSON
 json.dump(
     {
         "scene_name": "ut_campus_facade",
         "px_to_meter": px2m,
         "image_size_px": [W_px, H_px],
-        "wall_height_m": KNOWN_WALL_HEIGHT_M,
-        "crop_bottom_fraction": CROP_BOTTOM_FRACTION,
+        "wall_height_m": wall_height_m,
+        "wall_height_source": height_source,
+        "crop_source": crop_source,
+        "crop_bounds_px": [x_min_px, x_max_px, y_min_px, y_max_px],
         "objects": metadata,
     },
     open(os.path.join(OUTPUT_DIR, "sionna_scene.json"), "w"),
     indent=2,
 )
 
-# Step 8: Write facade_<name>.json (Output Requirements spec)
+# Step 10: Facade anchor JSON
 facade_json_path = write_facade_json(SCENE_NAME, obj_filename, telemetry, OUTPUT_DIR)
 print(f"\n✓ Facade anchor JSON → {facade_json_path}")
 print(json.dumps({
@@ -551,4 +547,6 @@ print(json.dumps({
     },
 }, indent=2))
 
-print(f"\n✓ done  —  {len(metadata)} mesh regions exported\n")
+print(f"\n✓ done  —  {len(metadata)} mesh regions exported")
+print(f"  height source : {height_source}")
+print(f"  crop source   : {crop_source}\n")

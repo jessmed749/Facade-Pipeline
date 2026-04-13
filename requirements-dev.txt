@@ -1,0 +1,16 @@
+# Dev/test dependencies — CPU only, no CUDA, no large models
+# Install with: pip install -r requirements-dev.txt
+
+pytest>=8.0
+pytest-cov
+
+# Lightweight CPU versions of the deps used by helper functions
+# (no torch GPU, no transformers model weights — just the math)
+numpy
+scipy
+scikit-image
+shapely
+pillow
+opencv-python-headless
+trimesh
+mapbox_earcut
