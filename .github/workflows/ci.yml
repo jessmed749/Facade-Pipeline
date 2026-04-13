@@ -28,7 +28,10 @@ jobs:
     if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
     steps:
       - name: Fix workspace permissions
-        run: sudo chown -R $USER:$USER ${{ github.workspace }} || true
+        run: |
+          sudo chown -R $USER:$USER ${{ github.workspace }}/.hf_cache || true
+          sudo chown -R $USER:$USER ${{ github.workspace }}/test-output || true
+          sudo chown -R $USER:$USER ${{ github.workspace }}/app/__pycache__ || true
 
       - uses: actions/checkout@v4
 
