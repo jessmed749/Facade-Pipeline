@@ -1,4 +1,7 @@
 
+# GitHub Actions self-hosted runner
+actions-runner/
+
 # Ignore model checkpoints and generated outputs
 checkpoints/
 output/

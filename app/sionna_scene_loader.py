@@ -50,7 +50,11 @@ def load_facade_scene(json_path: str = JSON_PATH):
         if fname.endswith(".obj"):
             cls = fname.replace(".obj", "")
             class_files[cls] = os.path.join(per_class_dir, fname)
-    class_files["pma_building"] = os.path.join(os.path.dirname(OUTPUT_DIR), "input", "pma_wfacade.obj")
+    input_dir = os.path.join(os.path.dirname(OUTPUT_DIR), "input")
+    for fname in os.listdir(input_dir):
+        if fname.endswith(".obj"):
+            cls = os.path.splitext(fname)[0]  # filename without extension becomes the class name
+            class_files[cls] = os.path.join(input_dir, fname)
 
     print("Per-class meshes found:")
     for cls, path in class_files.items():
