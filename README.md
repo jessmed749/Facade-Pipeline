@@ -100,10 +100,9 @@ CROP_RIGHT_FRACTION  = 0.92   # fraction of width to keep (crop right edge)
 These crop values are tuned per-photo. See the tuning guide below.
 
 ### 6. Run the pipeline
-> Run this in Windows PowerShell, not WSL
 
 ```bash
-.\run_full_pipeline.bat
+make run-pipeline
 ```
 
 ### 7. Inspect results
@@ -275,6 +274,8 @@ All parameters are at the top of `app/run_facade_pipeline.py`:
 
 ## Troubleshooting
 
+**`End of File error when running make download-models`**: Run `wsl sudo apt install dos2unix` and then `wsl sudo dos2unix scripts/download_models.sh`
+
 **`Permission denied` on `make clean`**
 Output files are owned by root (Docker runs as root). The Makefile uses `sudo rm`. Run `make clean` with your password.
 
@@ -293,6 +294,10 @@ The HuggingFace cache dir isn't writable. Make sure `.hf_cache/` exists in the p
 mkdir -p .hf_cache
 make run
 ```
+
+**`ArcGIS/ArcPy is can't validate license`**: Sometimes happens if you use Ctrl+C to force quit in the middle of a run. 
+Open task manager and end any lingering python tasks related to ArcGIS (often have ERSI in the file path). Then, try 
+opening the ArcGIS Pro app, then closing it and running the pipeline again.
 
 ---
 

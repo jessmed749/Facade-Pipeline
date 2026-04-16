@@ -68,3 +68,12 @@ The 3D model itself. The filename must perfectly match the `file_name` string in
 | Building walls are too jagged                     | * Increase `LOD2_SMOOTHNESS` (try 0.1 first) <br/> * Try adding the building ID to `FORCE_SHATTER_IDs` (to find the building ID, open data.gdb in ArcGIS Pro) <br/> * Increase `HEIGHT_TIER_CUTOFF` by a few meters <br/> * Change `LOD2_LEVEL_OF_DETAIL` to LOD1.3 (warning, this may affect facade accuracy, and it will affect rooftop accuracy) |
 | Out of memory crashes                             | * Decrease `PROCESSING_CORES` <br/> * If happening specifically during the DEM creation, try increasing `DEM_SAMPLING_AREA`                                                                                                                                                                                                                         |
 | Custom DEM creation not finishing after 24+ hours | * Area of Interest may be too big, try shrinking it                                                                                                                                                                                                                                                                                                 |
+
+
+---
+
+### Troubleshooting
+
+| Problem                           | Things to try                                                                                                                                                      |
+|-----------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Facades are on the wrong building | Check the coordinates in the facade_<name>.json file in the source_data folder. There can't be any buildings between the coordinates and the target wall/building. |

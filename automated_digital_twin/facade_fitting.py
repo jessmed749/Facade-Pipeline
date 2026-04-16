@@ -167,7 +167,7 @@ def extract_roof_heights(bldg_id, p1, p2, lod2_fc):
 
     def get_max_z_for_xy(corner_pt):
         pt_geom = arcpy.PointGeometry(corner_pt, SR)
-        search_radii = [1.0, 3.0, 5.0, 10.0]
+        search_radii = [1.0, 3.0, 5.0, 10.0]  # Use search_radii = [5.0, 10.0] if you aren't finding true corner height
         max_z = None
 
         for radius in search_radii:

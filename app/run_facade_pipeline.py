@@ -164,7 +164,7 @@ def extract_telemetry(image_path):
                                            "GPSLongitude", "GPSLongitudeRef")):
                     lat = _dms_to_decimal(gps["GPSLatitude"],  gps["GPSLatitudeRef"])
                     lon = _dms_to_decimal(gps["GPSLongitude"], gps["GPSLongitudeRef"])
-                for tag in ("GPSImgDirection", "GPSTrack"):
+                for tag in ("GPSImgDirection", "GPSTrack", "GPSDestBearing"):
                     if tag in gps:
                         v = gps[tag]
                         try:
@@ -203,7 +203,7 @@ def write_facade_json(scene_name, obj_filename, telemetry, output_dir):
         },
         "mesh_metadata": {
             "file_name":         obj_filename,
-            "front_facing_axis": "-Y",
+            "front_facing_axis": "+Y",
         },
     }
     out_path = os.path.join(output_dir, f"facade_{scene_name}.json")
@@ -587,7 +587,7 @@ def main():
         },
         "mesh_metadata": {
             "file_name":         obj_filename,
-            "front_facing_axis": "-Y",
+            "front_facing_axis": "+Y",
         },
     }, indent=2))
 
