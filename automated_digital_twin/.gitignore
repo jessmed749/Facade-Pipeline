@@ -1,0 +1,10 @@
+.idea
+data.gdb
+ATX_DEM_TIN
+data.Overviews
+Exports
+PLY_Exports
+ATX_LIDAR_2021.lasd
+__pycache__/
+source_data/*
+!source_data/.gitkeep

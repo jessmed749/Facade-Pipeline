@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -25,13 +25,12 @@ RUN apt-get update && apt-get install -y \
 
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
-RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+RUN python3 -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-RUN git clone https://github.com/facebookresearch/segment-anything.git
-RUN cd segment-anything && pip install -e .
+RUN python3 -m pip install git+https://github.com/facebookresearch/segment-anything.git
 
 COPY app /workspace/app
 COPY scripts /workspace/scripts
